@@ -989,6 +989,15 @@ class RehabDashboard:
             try:
                 # Load the CSV file
                 df = pd.read_csv(file_path)
+                if "person_id" in df.columns:
+                    person_ids = pd.to_numeric(df["person_id"], errors="coerce")
+                    df = df[person_ids == 1].copy()
+                    if df.empty:
+                        messagebox.showerror(
+                            "Error",
+                            "No rows for person ID 1 were found in this CSV.",
+                        )
+                        return
                 
                 # Process the data
                 self.process_uploaded_data(df)

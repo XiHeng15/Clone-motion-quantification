@@ -2,7 +2,11 @@ import pandas as pd
 import numpy as np
 import argparse
 import os
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
+
+
+FrameKey = Union[int, Tuple[int, int]]
+TARGET_PERSON_ID = 1
 
 
 def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
@@ -41,14 +45,23 @@ def parse_pose_csv(csv_file: str) -> pd.DataFrame:
     except Exception as e:
         print(f"Error reading CSV file: {e}")
         return None
+
+    if "person_id" in df.columns:
+        original_rows = len(df)
+        person_ids = pd.to_numeric(df["person_id"], errors="coerce")
+        df = df[person_ids == TARGET_PERSON_ID].copy()
+        print(
+            f"Imported {len(df)} rows for person ID {TARGET_PERSON_ID} "
+            f"from {original_rows} total rows."
+        )
     
     return df
 
 
-def extract_landmark_coordinates(df: pd.DataFrame) -> Dict[int, List[Tuple[float, float, float]]]:
+def extract_landmark_coordinates(df: pd.DataFrame) -> Dict[FrameKey, List[Tuple[float, float, float]]]:
     """
     Extract coordinates for each landmark from all frames.
-    Returns a dictionary mapping frame_index -> list of landmark coordinates.
+    Returns a dictionary mapping frame_index or (frame, person_id) -> list of landmark coordinates.
     """
     frames_data = {}
     
@@ -62,12 +75,17 @@ def extract_landmark_coordinates(df: pd.DataFrame) -> Dict[int, List[Tuple[float
             z = row[f"landmark_{i}_z"]
             landmarks.append((x, y, z))
         
-        frames_data[frame_idx] = landmarks
+        if "frame" in df.columns and "person_id" in df.columns:
+            key = (int(row["frame"]), int(row["person_id"]))
+        else:
+            key = frame_idx
+
+        frames_data[key] = landmarks
     
     return frames_data
 
 
-def calculate_kinematics(frames_data: Dict[int, List[Tuple[float, float, float]]]) -> pd.DataFrame:
+def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, float]]]) -> pd.DataFrame:
     """
     Calculate clinically relevant kinematics from the landmark data.
     Returns a DataFrame with all calculated kinematics.
@@ -297,8 +315,12 @@ def calculate_kinematics(frames_data: Dict[int, List[Tuple[float, float, float]]
     # Create a DataFrame from the kinematics data
     kinematics_df = pd.DataFrame(kinematics_data)
     
-    # Add a frame index column
-    kinematics_df.insert(0, "frame", list(frames_data.keys()))
+    keys = list(frames_data.keys())
+    if keys and isinstance(keys[0], tuple):
+        kinematics_df.insert(0, "person_id", [key[1] for key in keys])
+        kinematics_df.insert(0, "frame", [key[0] for key in keys])
+    else:
+        kinematics_df.insert(0, "frame", keys)
     
     return kinematics_df
 

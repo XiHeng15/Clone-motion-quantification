@@ -4,3 +4,21 @@
 /P06_pose.csv
 /rehab_data.json
 /report_Kai Armstrong_20250227.pdf
+
+# Local Python environments
+.venv/
+.venv*/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Generated media and large data exports
+*.mp4
+*.MP4
+*.avi
+*.AVI
+book.csv
+book_*.csv
+*_annotated.mp4
+*_annotated.MP4

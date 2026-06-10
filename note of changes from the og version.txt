@@ -1,0 +1,8 @@
+I do need to go back and actually upload but later
+changed the old mediapipe api to the newer mediapipe tasks pose landmarker api for multiple poses
+can do multiple csv (need to remove)
+added yolo gating to help with seperating people
+adjusted the smoothing to reduce jitters
+added clamping to prevent final pose landmarks from extending outside the yolo person box
+made it so only id 1 gets their csv file data created
+made it so that it also outputs the video file createdfrom the pose esitmation?
