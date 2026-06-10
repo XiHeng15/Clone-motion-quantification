@@ -14,10 +14,17 @@ __pycache__/
 *.pyc
 
 # Generated media and large data exports
+*.csv
 *.mp4
 *.MP4
 *.avi
 *.AVI
+*.mov
+*.MOV
+*.mkv
+*.MKV
+*.wmv
+*.WMV
 book.csv
 book_*.csv
 *_annotated.mp4
