@@ -6,3 +6,5 @@ adjusted the smoothing to reduce jitters
 added clamping to prevent final pose landmarks from extending outside the yolo person box
 made it so only id 1 gets their csv file data created
 made it so that it also outputs the video file createdfrom the pose esitmation?
+
+updated the thingy on how to normalize the data and stuff 

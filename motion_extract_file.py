@@ -2,6 +2,7 @@ import argparse
 import csv
 import os
 from typing import List, Optional, Tuple
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -13,6 +14,64 @@ from mediapipe.tasks.python import vision
 LANDMARK_COUNT = 33
 POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
 
+def normalize_landmarks(landmarks: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
+    left_hip = np.array(landmarks[23])
+    right_hip = np.array(landmarks[24])
+    left_shoulder = np.array(landmarks[11])
+    right_shoulder = np.array(landmarks[12])
+
+    hip_center = (left_hip + right_hip) / 2
+    shoulder_center = (left_shoulder + right_shoulder) / 2
+
+    torso_length = np.linalg.norm(shoulder_center - hip_center)
+
+    if torso_length == 0 or np.isnan(torso_length):
+        return landmarks
+
+    normalized_landmarks = []
+
+    for landmark in landmarks:
+        point = np.array(landmark)
+        normalized_point = (point - hip_center) / torso_length
+        normalized_landmarks.append(tuple(normalized_point))
+
+    return normalized_landmarks
+
+def apply_rolling_median(
+    landmarks_buffer: deque,
+    current_landmarks: List[Tuple[float, float, float]],
+    window_size: int = 5,
+) -> List[Tuple[float, float, float]]:
+    """
+    Apply rolling median to smooth landmarks and remove outliers.
+    """
+    if window_size < 1:
+        return current_landmarks
+    
+    landmarks_buffer.append(current_landmarks)
+    
+    # Keep only the most recent frames
+    if len(landmarks_buffer) > window_size:
+        landmarks_buffer.popleft()
+    
+    # If we don't have enough frames yet, return current landmarks
+    if len(landmarks_buffer) < window_size:
+        return current_landmarks
+    
+    # Apply median across the buffer for each landmark
+    filtered_landmarks = []
+    for landmark_idx in range(len(current_landmarks)):
+        x_values = [landmarks[landmark_idx][0] for landmarks in landmarks_buffer]
+        y_values = [landmarks[landmark_idx][1] for landmarks in landmarks_buffer]
+        z_values = [landmarks[landmark_idx][2] for landmarks in landmarks_buffer]
+        
+        median_x = np.median(x_values)
+        median_y = np.median(y_values)
+        median_z = np.median(z_values)
+        
+        filtered_landmarks.append((float(median_x), float(median_y), float(median_z)))
+    
+    return filtered_landmarks
 
 def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """
@@ -33,6 +92,128 @@ def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     cosine_angle = np.dot(ba, bc) / denominator
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     return np.degrees(angle)
+
+
+def _relative_change(prev: float, curr: float) -> float:
+    return abs(curr - prev) / max(abs(prev), 1e-6)
+
+
+def torso_widths(landmarks: List[Tuple[float, float, float]]) -> Tuple[float, float]:
+    left_shoulder = np.array(landmarks[11])
+    right_shoulder = np.array(landmarks[12])
+    left_hip = np.array(landmarks[23])
+    right_hip = np.array(landmarks[24])
+    shoulder_width = np.linalg.norm(left_shoulder - right_shoulder)
+    hip_width = np.linalg.norm(left_hip - right_hip)
+    return shoulder_width, hip_width
+
+
+def limb_lengths(landmarks: List[Tuple[float, float, float]]) -> List[float]:
+    pairs = [
+        (11, 13),
+        (13, 15),
+        (12, 14),
+        (14, 16),
+        (23, 25),
+        (25, 27),
+        (24, 26),
+        (26, 28),
+    ]
+    return [
+        float(np.linalg.norm(np.array(landmarks[a]) - np.array(landmarks[b])))
+        for a, b in pairs
+    ]
+
+
+def knee_angles(landmarks: List[Tuple[float, float, float]]) -> Tuple[float, float]:
+    left_knee = calculate_angle(
+        np.array(landmarks[23]),
+        np.array(landmarks[25]),
+        np.array(landmarks[27]),
+    )
+    right_knee = calculate_angle(
+        np.array(landmarks[24]),
+        np.array(landmarks[26]),
+        np.array(landmarks[28]),
+    )
+    return left_knee, right_knee
+
+
+def landmarks_inside_box(
+    landmarks: List[Tuple[float, float, float]],
+    box: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+) -> bool:
+    x1, y1, x2, y2 = box
+    min_x = x1 / frame_width
+    max_x = x2 / frame_width
+    min_y = y1 / frame_height
+    max_y = y2 / frame_height
+    return all(min_x <= x <= max_x and min_y <= y <= max_y for x, y, _ in landmarks)
+
+
+def is_side_order_valid(landmarks: List[Tuple[float, float, float]]) -> bool:
+    left_right_pairs = [
+        (11, 12),
+        (13, 14),
+        (15, 16),
+        (23, 24),
+        (25, 26),
+        (27, 28),
+    ]
+    return all(landmarks[left][0] <= landmarks[right][0] for left, right in left_right_pairs)
+
+
+def is_pose_anatomically_plausible(
+    previous_landmarks: Optional[List[Tuple[float, float, float]]],
+    current_landmarks: List[Tuple[float, float, float]],
+    previous_box: Optional[np.ndarray],
+    current_box: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+    clamp_pose_to_yolo_box: bool,
+) -> bool:
+    if not is_side_order_valid(current_landmarks):
+        return False
+
+    if clamp_pose_to_yolo_box and not landmarks_inside_box(
+        current_landmarks,
+        current_box,
+        frame_width,
+        frame_height,
+    ):
+        return False
+
+    if previous_landmarks is None:
+        return True
+
+    prev_left, prev_right = knee_angles(previous_landmarks)
+    curr_left, curr_right = knee_angles(current_landmarks)
+    if abs(curr_left - prev_left) > 40 or abs(curr_right - prev_right) > 40:
+        return False
+
+    prev_shoulder, prev_hip = torso_widths(previous_landmarks)
+    curr_shoulder, curr_hip = torso_widths(current_landmarks)
+    if _relative_change(prev_shoulder, curr_shoulder) > 0.25:
+        return False
+    if _relative_change(prev_hip, curr_hip) > 0.25:
+        return False
+
+    prev_lengths = limb_lengths(previous_landmarks)
+    curr_lengths = limb_lengths(current_landmarks)
+    for prev_length, curr_length in zip(prev_lengths, curr_lengths):
+        if _relative_change(prev_length, curr_length) > 0.25:
+            return False
+
+    if previous_box is not None:
+        prev_center = np.array([(previous_box[0] + previous_box[2]) / 2, (previous_box[1] + previous_box[3]) / 2])
+        curr_center = np.array([(current_box[0] + current_box[2]) / 2, (current_box[1] + current_box[3]) / 2])
+        box_diag = np.linalg.norm([previous_box[2] - previous_box[0], previous_box[3] - previous_box[1]])
+        if np.linalg.norm(curr_center - prev_center) > 0.5 * box_diag:
+            return False
+
+    return True
 
 
 def landmark_to_tuple(landmark) -> Tuple[float, float, float]:
@@ -269,7 +450,7 @@ def detect_people_with_yolo(
 
 def save_to_csv(
     landmarks_history: List[
-        Tuple[int, int, Optional[float], bool, List[Tuple[float, float, float]]]
+        Tuple[int, int, Optional[float], bool, bool, List[Tuple[float, float, float]]]
     ],
     filename: str = "pose_data.csv",
     output_person_id: Optional[int] = 1,
@@ -286,17 +467,24 @@ def save_to_csv(
     with open(filename, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
 
-        header = ["frame", "person_id", "yolo_confidence", "overlap_warning"]
+        header = [
+            "frame",
+            "person_id",
+            "yolo_confidence",
+            "overlap_warning",
+            "is_anatomically_valid",
+        ]
         for i in range(LANDMARK_COUNT):
             header.extend([f"landmark_{i}_x", f"landmark_{i}_y", f"landmark_{i}_z"])
         writer.writerow(header)
 
-        for frame_idx, person_id, yolo_confidence, overlap_warning, landmarks in landmarks_history:
+        for frame_idx, person_id, yolo_confidence, overlap_warning, is_valid, landmarks in landmarks_history:
             row = [
                 frame_idx,
                 person_id,
                 "" if yolo_confidence is None else yolo_confidence,
                 int(overlap_warning),
+                int(is_valid),
             ]
             for landmark in landmarks:
                 row.extend(landmark)
@@ -329,11 +517,14 @@ def process_video(
     landmark_smoothing: float,
     clamp_pose_to_yolo_box: bool,
     priority_person_id: int,
+    anatomy_correction_mode: str,
     output_person_id: Optional[int],
 ):
     """
     Process a video file and extract pose data for up to max_poses people.
     """
+    prev_pose_by_person = {}
+    prev_box_by_person = {}
     cap = cv2.VideoCapture(input_file)
 
     if not cap.isOpened():
@@ -379,10 +570,10 @@ def process_video(
     with create_pose_landmarker(model_path, pose_max_count, running_mode) as pose:
         landmarks_history = []
         smoothed_landmarks_by_person = {}
+        landmarks_buffers_by_person = {}
         frame_count = 0
 
         cv2.namedWindow("MediaPipe Multi-Person Pose Estimation", cv2.WINDOW_NORMAL)
-
         while cap.isOpened():
             success, image = cap.read()
             if not success:
@@ -459,6 +650,7 @@ def process_video(
                     if not pose_landmarks:
                         continue
 
+                    
                     frame_landmarks = convert_crop_landmarks_to_full_frame(
                         pose_landmarks[0],
                         crop_bounds,
@@ -472,6 +664,8 @@ def process_video(
                             frame_width,
                             frame_height,
                         )
+                    if person_id not in landmarks_buffers_by_person:
+                        landmarks_buffers_by_person[person_id] = deque(maxlen=5)
                     frame_landmarks = smooth_landmarks(
                         smoothed_landmarks_by_person.get(person_id),
                         frame_landmarks,
@@ -484,15 +678,37 @@ def process_video(
                             frame_width,
                             frame_height,
                         )
+                    frame_landmarks = apply_rolling_median(
+                        landmarks_buffers_by_person[person_id],
+                        frame_landmarks,
+                        window_size=5,
+                    )
+                    prev_pose = prev_pose_by_person.get(person_id)
+                    prev_box = prev_box_by_person.get(person_id)
+                    is_valid = is_pose_anatomically_plausible(
+                        prev_pose,
+                        frame_landmarks,
+                        prev_box,
+                        box,
+                        frame_width,
+                        frame_height,
+                        clamp_pose_to_yolo_box,
+                    )
+
+                    if not is_valid:
+                        if anatomy_correction_mode == "fallback":
+                            if prev_pose is not None:
+                                frame_landmarks = prev_pose
+                                is_valid = True
+                        # if mode is flag, keep the invalid frame and mark it
+
                     smoothed_landmarks_by_person[person_id] = frame_landmarks
+                    prev_pose_by_person[person_id] = frame_landmarks
+                    prev_box_by_person[person_id] = box
+                    raw_landmarks = frame_landmarks
+                    normalized_landmarks = normalize_landmarks(frame_landmarks)
                     landmarks_history.append(
-                        (
-                            frame_count,
-                            person_id,
-                            detection["confidence"],
-                            overlap_warning,
-                            frame_landmarks,
-                        )
+                        (frame_count, person_id, box, overlap_warning, is_valid, normalized_landmarks)
                     )
 
                     draw_pose_tuples(image, frame_landmarks, color)
@@ -517,7 +733,9 @@ def process_video(
                         landmark_smoothing,
                     )
                     smoothed_landmarks_by_person[person_id] = frame_landmarks
-                    landmarks_history.append((frame_count, person_id, None, False, frame_landmarks))
+                    landmarks_history.append(
+                        (frame_count, person_id, None, False, True, frame_landmarks)
+                    )
 
                     draw_pose(image, person_landmarks, colors[person_id])
                     draw_knee_angles(image, frame_landmarks, person_id, colors[person_id], person_id)
@@ -664,6 +882,12 @@ def main():
         help="Allow MediaPipe landmarks from YOLO crops to extend outside the YOLO person box",
     )
     parser.add_argument(
+        "--anatomy-correction-mode",
+        choices=["fallback", "flag"],
+        default="fallback",
+        help="How to handle frames that fail anatomical validation: fallback=use previous valid pose, flag=keep and mark invalid.",
+    )
+    parser.add_argument(
         "--priority-person-id",
         type=int,
         default=1,
@@ -709,6 +933,7 @@ def main():
         args.landmark_smoothing,
         not args.allow_pose_outside_yolo_box,
         args.priority_person_id,
+        args.anatomy_correction_mode,
         output_person_id,
     )
 
