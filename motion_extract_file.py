@@ -37,6 +37,35 @@ def normalize_landmarks(landmarks: List[Tuple[float, float, float]]) -> List[Tup
 
     return normalized_landmarks
 
+
+def nan_landmarks() -> List[Tuple[float, float, float]]:
+    return [(float("nan"), float("nan"), float("nan")) for _ in range(LANDMARK_COUNT)]
+
+
+def ensure_output_person_frame(
+    landmarks_history: List[
+        Tuple[int, int, Optional[float], bool, bool, List[Tuple[float, float, float]]]
+    ],
+    frame_idx: int,
+    output_person_id: Optional[int],
+    written_person_ids: set,
+    fallback_landmarks: Optional[List[Tuple[float, float, float]]],
+    normalize_fallback: bool,
+) -> None:
+    if output_person_id is None:
+        return
+
+    if output_person_id in written_person_ids:
+        return
+
+    landmarks = fallback_landmarks if fallback_landmarks is not None else nan_landmarks()
+    if normalize_fallback:
+        landmarks = normalize_landmarks(landmarks)
+
+    landmarks_history.append(
+        (frame_idx, output_person_id, None, False, False, landmarks)
+    )
+
 def apply_rolling_median(
     landmarks_buffer: deque,
     current_landmarks: List[Tuple[float, float, float]],
@@ -583,6 +612,7 @@ def process_video(
             frame_count += 1
             h, _, _ = image.shape
             clean_image = image.copy()
+            written_person_ids = set()
 
             if use_yolo_gate:
                 detections = detect_people_with_yolo(yolo_model, clean_image, yolo_confidence, yolo_iou)
@@ -708,8 +738,16 @@ def process_video(
                     raw_landmarks = frame_landmarks
                     normalized_landmarks = normalize_landmarks(frame_landmarks)
                     landmarks_history.append(
-                        (frame_count, person_id, box, overlap_warning, is_valid, normalized_landmarks)
+                        (
+                            frame_count,
+                            person_id,
+                            detection["confidence"],
+                            overlap_warning,
+                            is_valid,
+                            normalized_landmarks,
+                        )
                     )
+                    written_person_ids.add(person_id)
 
                     draw_pose_tuples(image, frame_landmarks, color)
                     draw_knee_angles(image, frame_landmarks, person_id, color, detection_idx)
@@ -736,9 +774,21 @@ def process_video(
                     landmarks_history.append(
                         (frame_count, person_id, None, False, True, frame_landmarks)
                     )
+                    written_person_ids.add(person_id)
 
                     draw_pose(image, person_landmarks, colors[person_id])
                     draw_knee_angles(image, frame_landmarks, person_id, colors[person_id], person_id)
+
+            ensure_output_person_frame(
+                landmarks_history,
+                frame_count,
+                output_person_id,
+                written_person_ids,
+                prev_pose_by_person.get(output_person_id)
+                if use_yolo_gate
+                else smoothed_landmarks_by_person.get(output_person_id),
+                use_yolo_gate,
+            )
 
             progress = frame_count / total_frames * 100 if total_frames else 0
             cv2.putText(
