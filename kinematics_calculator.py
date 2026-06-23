@@ -7,45 +7,21 @@ from typing import List, Tuple, Dict, Union
 
 FrameKey = Union[int, Tuple[int, int]]
 TARGET_PERSON_ID = 1
-UPPER_BODY_ANGLE_COLUMNS = [
-    "left_shoulder_angle",
-    "right_shoulder_angle",
-    "left_elbow_angle",
-    "right_elbow_angle",
-    "trunk_flexion",
-    "trunk_lateral_flexion",
-    "neck_flexion",
-    "neck_lateral_flexion",
-]
-ANGLE_VIDEO_GROUPS = {
-    "left": [
-        "left_shoulder_angle",
-        "left_elbow_angle",
-    ],
-    "right": [
-        "right_shoulder_angle",
-        "right_elbow_angle",
-    ],
-    "middle": [
-        "trunk_flexion",
-        "trunk_lateral_flexion",
-        "neck_flexion",
-        "neck_lateral_flexion",
-    ],
-}
-
 
 def project_to_frontal(point: np.ndarray) -> np.ndarray:
-    """Return the x/y coordinates used for frontal-plane calculations."""
-    return np.array(point, dtype=float)[:2]
-
+    """ 
+    Project a 3D landmark onto the frontal plane by dropping depth.
+    MediaPipe pose uses x/y image coordinates and z depth, so frontal plane = x-y.
+    """
+    point = np.array(point)
+    return np.array([point[0], point[1], 0.0])
 
 def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """
-    Calculate the angle between three points in the frontal plane.
+    Calculate the angle between three points in 3D space.
     The angle is calculated at point b.
     """
-    # Convert to frontal-plane x/y coordinates.
+    # Convert to numpy arrays if not already
     a = project_to_frontal(a)
     b = project_to_frontal(b)
     c = project_to_frontal(c)
@@ -54,12 +30,11 @@ def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     ba = a - b
     bc = c - b
     
-    # Calculate cosine of angle using dot product
     denominator = np.linalg.norm(ba) * np.linalg.norm(bc)
-    if denominator == 0 or np.isnan(denominator):
+    if denominator == 0:
         return np.nan
-
-    cosine_angle = np.dot(ba, bc) / denominator
+    # Calculate cosine of angle using dot product
+    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     
     # Convert to degrees
@@ -232,16 +207,16 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
         )
         
         # Shoulder angles (flexion/extension)
-        left_shoulder_vertical = get_landmark(landmarks["left_shoulder"]) + np.array([0, -1, 0])
-        right_shoulder_vertical = get_landmark(landmarks["right_shoulder"]) + np.array([0, -1, 0])
+        # left_shoulder_vertical = get_landmark(landmarks["left_shoulder"]) + np.array([0, -1, 0])
+        # right_shoulder_vertical = get_landmark(landmarks["right_shoulder"]) + np.array([0, -1, 0])
         
         left_shoulder_angle = calculate_angle(
-            left_shoulder_vertical,
+            get_landmark(landmarks["left_hip"]),
             get_landmark(landmarks["left_shoulder"]),
             get_landmark(landmarks["left_elbow"])
         )
         right_shoulder_angle = calculate_angle(
-            right_shoulder_vertical,
+            get_landmark(landmarks["right_hip"]),
             get_landmark(landmarks["right_shoulder"]),
             get_landmark(landmarks["right_elbow"])
         )
@@ -276,20 +251,24 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             shoulder_center
         )
         
-        # Trunk lateral flexion (side bend) in the frontal plane
-        hip_line = project_to_frontal(right_hip) - project_to_frontal(left_hip)
-        hip_up = np.array([-hip_line[1], hip_line[0]])
-        hip_up_norm = np.linalg.norm(hip_up)
-        hip_to_shoulder_frontal = project_to_frontal(shoulder_center) - project_to_frontal(hip_center)
-        hip_to_shoulder_norm = np.linalg.norm(hip_to_shoulder_frontal)
-
-        if hip_up_norm == 0 or hip_to_shoulder_norm == 0:
-            trunk_lateral_flexion = np.nan
-        else:
-            hip_up = hip_up / hip_up_norm
-            trunk_lateral_flexion = np.degrees(np.arccos(
-                np.clip(np.dot(hip_up, hip_to_shoulder_frontal) / hip_to_shoulder_norm, -1.0, 1.0)
-            ))
+        # Trunk lateral flexion (side bend)
+        # Create a line from left hip to right hip
+        hip_line = right_hip - left_hip
+        # Create a perpendicular line (up) from the hip line
+        hip_up = np.cross(hip_line, np.array([0, 0, 1]))
+        hip_up = hip_up / np.linalg.norm(hip_up)
+        
+        # Line from hip center to shoulder center
+        hip_to_shoulder = shoulder_center - hip_center
+        
+        # Project hip_to_shoulder onto the frontal plane
+        frontal_plane_normal = np.array([0, 0, 1])
+        hip_to_shoulder_frontal = hip_to_shoulder - np.dot(hip_to_shoulder, frontal_plane_normal) * frontal_plane_normal
+        
+        # Calculate the angle between hip_up and hip_to_shoulder_frontal
+        trunk_lateral_flexion = np.degrees(np.arccos(
+            np.clip(np.dot(hip_up, hip_to_shoulder_frontal) / np.linalg.norm(hip_to_shoulder_frontal), -1.0, 1.0)
+        ))
         
         # Neck angles
         neck = get_landmark(landmarks["neck"])
@@ -311,15 +290,13 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
         # Create a vector from neck to ear center
         neck_to_ear = ear_center - neck
         
-        # Calculate the angle between vertical and neck_to_ear in the frontal plane
-        neck_to_ear_frontal = project_to_frontal(neck_to_ear)
-        neck_to_ear_norm = np.linalg.norm(neck_to_ear_frontal)
-        if neck_to_ear_norm == 0:
-            neck_lateral_flexion = np.nan
-        else:
-            neck_lateral_flexion = np.degrees(np.arccos(
-                np.clip(np.dot(np.array([0, -1]), neck_to_ear_frontal) / neck_to_ear_norm, -1.0, 1.0)
-            ))
+        # Project neck_to_ear onto the frontal plane
+        neck_to_ear_frontal = neck_to_ear - np.dot(neck_to_ear, frontal_plane_normal) * frontal_plane_normal
+        
+        # Calculate the angle between vertical and neck_to_ear_frontal
+        neck_lateral_flexion = np.degrees(np.arccos(
+            np.clip(np.dot(np.array([0, -1, 0]), neck_to_ear_frontal) / np.linalg.norm(neck_to_ear_frontal), -1.0, 1.0)
+        ))
         
         # Calculate symmetry metrics (absolute difference between left and right)
         knee_angle_symmetry = abs(left_knee_angle - right_knee_angle)
@@ -357,210 +334,59 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
     
     return kinematics_df
 
-
-def add_anatomical_validity(
-    kinematics_df: pd.DataFrame,
-    pose_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """Copy the source pose validity flag onto the matching kinematics rows."""
-    if "is_anatomically_valid" not in pose_df.columns:
-        return kinematics_df
-
-    result = kinematics_df.copy()
-    if "frame" in pose_df.columns and "person_id" in pose_df.columns:
-        validity = (
-            pose_df.drop_duplicates(["frame", "person_id"], keep="last")
-            .set_index(["frame", "person_id"])["is_anatomically_valid"]
-        )
-        row_keys = pd.MultiIndex.from_frame(result[["frame", "person_id"]])
-        values = validity.reindex(row_keys).to_numpy()
-    elif "frame" in pose_df.columns:
-        validity = (
-            pose_df.drop_duplicates("frame", keep="last")
-            .set_index("frame")["is_anatomically_valid"]
-        )
-        values = result["frame"].map(validity).to_numpy()
-    else:
-        values = pose_df["is_anatomically_valid"].reindex(result["frame"]).to_numpy()
-
-    insert_at = result.columns.get_loc("person_id") + 1 if "person_id" in result.columns else 1
-    result.insert(insert_at, "is_anatomically_valid", values)
-    return result
-
-
-def create_angle_graph_video(
-    kinematics_df: pd.DataFrame,
+def create_angle_graph_video(kinematics_df: pd.DataFrame,
     output_video: str,
     angle_columns: List[str],
-    fps: float,
-    window_seconds: float,
-    title: str,
-) -> None:
+    fps: float,):
     """
-    Create an MP4 where angle traces scroll in real time.
+    Create a video with graphs of the calculated angles over time.
+    This function is a placeholder and can be implemented using libraries like matplotlib and OpenCV.
     """
-    import cv2
-    import matplotlib
-
-    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
-    if "frame" not in kinematics_df.columns:
-        print("Error: Cannot create graph video because the kinematics data has no frame column.")
-        return
-
-    if fps <= 0:
-        print("Error: FPS must be greater than 0 to create a graph video.")
-        return
-
-    if window_seconds <= 0:
-        print("Error: Graph window seconds must be greater than 0.")
-        return
+    import cv2
 
     df = kinematics_df.copy()
-    df["time"] = pd.to_numeric(df["frame"], errors="coerce") / fps
-    df = df.sort_values("time").reset_index(drop=True)
-
-    valid_angle_columns = [
-        column for column in angle_columns if column in df.columns
-    ]
-    if not valid_angle_columns:
-        print(
-            "Error: None of the requested angle columns exist in the kinematics data. "
-            f"Available columns: {', '.join(df.columns)}"
-        )
-        return
-
-    df[valid_angle_columns] = df[valid_angle_columns].apply(
-        pd.to_numeric,
-        errors="coerce",
-    )
-    df = df.dropna(subset=["time"])
-    if df.empty:
-        print("Error: No valid frame/time data available for graph video.")
-        return
-
-    width, height = 1280, 720
-    output_dir = os.path.dirname(output_video)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    df["time"] = df["frame"] / fps
+    
+    width, height = 960, 720
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
     if not writer.isOpened():
-        print(f"Error: Could not create graph video: {output_video}")
+        print(f"Error: Could not open video writer for {output_video}")
         return
-
-    x_values = df["time"].to_numpy(dtype=float)
-    y_values_by_column = {
-        column: df[column].to_numpy(dtype=float)
-        for column in valid_angle_columns
-    }
-
-    finite_values = np.concatenate(
-        [
-            values[np.isfinite(values)]
-            for values in y_values_by_column.values()
-            if np.isfinite(values).any()
-        ]
-    )
-    if finite_values.size == 0:
-        print("Error: No valid angle values available for graph video.")
+    valid_angle_columns = [col for col in angle_columns if col in df.columns]
+    if not valid_angle_columns:
+        print("Error: No valid angle columns found in DataFrame")
         writer.release()
-        return
-
-    y_padding = 10
-    y_min = float(np.nanmin(finite_values)) - y_padding
-    y_max = float(np.nanmax(finite_values)) + y_padding
-    if y_min == y_max:
-        y_min -= y_padding
-        y_max += y_padding
-
-    x_min = float(np.nanmin(x_values))
-    x_max = float(np.nanmax(x_values))
-    if x_min == x_max:
-        x_max = x_min + 1 / fps
-
-    fig, ax = plt.subplots(figsize=(12.8, 7.2), dpi=100)
-    lines = {}
-    markers = {}
-    for column in valid_angle_columns:
-        (line,) = ax.plot([], [], label=column.replace("_", " "), linewidth=2)
-        (marker,) = ax.plot([], [], marker="o", linestyle="None", markersize=6)
-        lines[column] = line
-        markers[column] = marker
-
-    ax.set_title(title)
-    ax.set_xlabel("Time (seconds)")
-    ax.set_ylabel("Angle (degrees)")
-    ax.set_ylim(y_min, y_max)
-    ax.grid(True, alpha=0.35)
-    ax.legend(loc="upper right", fontsize=8)
-    fig.tight_layout()
-
-    for frame_index in range(len(df)):
-        current_time = x_values[frame_index]
-        window_start = max(x_min, current_time - window_seconds)
-        window_end = window_start + window_seconds
-        if window_end > x_max:
-            window_end = x_max
-            window_start = max(x_min, window_end - window_seconds)
-
-        window_mask = (
-            (x_values >= window_start)
-            & (x_values <= current_time)
-        )
-
-        for column in valid_angle_columns:
-            y_values = y_values_by_column[column]
-            lines[column].set_data(x_values[window_mask], y_values[window_mask])
-
-            current_value = y_values[frame_index]
-            if np.isfinite(current_value):
-                markers[column].set_data([current_time], [current_value])
-            else:
-                markers[column].set_data([], [])
-
-        ax.set_xlim(window_start, window_end)
-        ax.set_title(f"{title} - {current_time:.2f}s")
-
-        fig.canvas.draw()
-        frame_rgba = np.asarray(fig.canvas.buffer_rgba())
-        frame_rgb = frame_rgba[:, :, :3]
-        frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        writer.write(frame_bgr)
-
-        if (frame_index + 1) % 100 == 0:
-            print(f"Rendered {output_video} frame {frame_index + 1}/{len(df)}")
-
-    plt.close(fig)
-    writer.release()
-    print(f"Angle graph video saved to {output_video}")
-
-
-def grouped_graph_video_path(output_video: str, group_name: str) -> str:
-    base, extension = os.path.splitext(output_video)
-    if not extension:
-        extension = ".mp4"
-    return f"{base}_{group_name}{extension}"
-
-
-def create_upper_body_angle_graph_videos(
-    kinematics_df: pd.DataFrame,
-    output_video: str,
-    fps: float,
-    window_seconds: float,
-) -> None:
-    for group_name, angle_columns in ANGLE_VIDEO_GROUPS.items():
-        group_output = grouped_graph_video_path(output_video, group_name)
-        create_angle_graph_video(
-            kinematics_df,
-            group_output,
-            angle_columns,
-            fps,
-            window_seconds,
-            f"{group_name.title()} Upper Body Angles",
-        )
+        return  
+    x_values = df["time"].to_numpy()
+    for i in range(len(df)):
+        plt.figure(figsize=(width / 100, height / 100), dpi=100)
+        for col in valid_angle_columns:
+            plt.plot(x_values[:i+1], df[col][:i+1], label=col)
+        plt.xlabel("Time (s)")
+        plt.ylabel("Angle (degrees)")
+        plt.title("Joint Angles Over Time")
+        plt.legend()
+        plt.xlim(0, x_values[-1])
+        plt.ylim(0, 180)
+        plt.grid()
+        
+        plt.tight_layout()
+        
+        # Save the plot to a temporary image file
+        temp_image = "temp_plot.png"
+        plt.savefig(temp_image)
+        plt.close()
+        
+        # Read the image and write it to the video
+        frame = cv2.imread(temp_image)
+        if frame is not None:
+            writer.write(frame)
+        else:
+            print(f"Error: Could not read temporary image {temp_image}")
+        os.remove(temp_image)
 
 
 def main():
@@ -569,22 +395,6 @@ def main():
     parser.add_argument("input_csv", help="Path to the input CSV file containing pose data")
     parser.add_argument("--output", "-o", help="Path to the output CSV file (default: 'clinical_kinematics.csv')", 
                         default="clinical_kinematics.csv")
-    parser.add_argument(
-        "--fps",
-        type=float,
-        default=30.0,
-        help="Video FPS used to convert frame numbers into seconds for graph output.",
-    )
-    parser.add_argument(
-        "--graph-video",
-        help="Optional base MP4 output path for animated upper-body angle graphs. Creates _left, _right, and _middle videos.",
-    )
-    parser.add_argument(
-        "--graph-window-seconds",
-        type=float,
-        default=30.0,
-        help="Number of seconds shown in the scrolling graph window.",
-    )
     args = parser.parse_args()
     
     # Parse the input CSV file
@@ -597,8 +407,6 @@ def main():
     
     # Calculate kinematics
     kinematics_df = calculate_kinematics(frames_data)
-    kinematics_df = add_anatomical_validity(kinematics_df, pose_df)
-    kinematics_df["time"] = kinematics_df["frame"] / args.fps
     
     # Save the kinematics data to a CSV file
     try:
@@ -606,14 +414,6 @@ def main():
         print(f"Clinical kinematics data saved to {args.output}")
     except Exception as e:
         print(f"Error saving kinematics data: {e}")
-
-    if args.graph_video:
-        create_upper_body_angle_graph_videos(
-            kinematics_df,
-            args.graph_video,
-            args.fps,
-            args.graph_window_seconds,
-        )
 
 
 if __name__ == "__main__":
