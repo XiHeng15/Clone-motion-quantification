@@ -10,15 +10,33 @@ TARGET_PERSON_ID = 1
 
 def project_to_frontal(point: np.ndarray) -> np.ndarray:
     """ 
-    Project a 3D landmark onto the frontal plane by dropping depth.
-    MediaPipe pose uses x/y image coordinates and z depth, so frontal plane = x-y.
+    Project a MediaPipe 3D landmark onto the camera's frontal image plane.
+
+    MediaPipe pose uses x/y image coordinates and z depth. For this project,
+    frontal-plane angles are calculated from x/y only, so depth is discarded.
     """
     point = np.array(point)
     return np.array([point[0], point[1], 0.0])
 
+
+def safe_vector_angle(vector_a: np.ndarray, vector_b: np.ndarray) -> float:
+    """
+    Calculate the angle between two already projected vectors.
+    Returns NaN if either vector has zero length.
+    """
+    vector_a = np.array(vector_a)
+    vector_b = np.array(vector_b)
+
+    denominator = np.linalg.norm(vector_a) * np.linalg.norm(vector_b)
+    if denominator == 0 or np.isnan(denominator):
+        return np.nan
+
+    cosine_angle = np.dot(vector_a, vector_b) / denominator
+    return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
+
 def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """
-    Calculate the angle between three points in 3D space.
+    Calculate the frontal-plane angle between three MediaPipe points.
     The angle is calculated at point b.
     """
     # Convert to numpy arrays if not already
@@ -30,17 +48,7 @@ def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     ba = a - b
     bc = c - b
     
-    denominator = np.linalg.norm(ba) * np.linalg.norm(bc)
-    if denominator == 0:
-        return np.nan
-    # Calculate cosine of angle using dot product
-    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-    angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-    
-    # Convert to degrees
-    angle = np.degrees(angle)
-    
-    return angle
+    return safe_vector_angle(ba, bc)
 
 
 def parse_pose_csv(csv_file: str) -> pd.DataFrame:
@@ -162,7 +170,7 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
         
         # Calculate joint angles
         
-        # Knee angles (extension/flexion)
+        # Knee angles in the frontal image plane
         left_knee_angle = calculate_angle(
             get_landmark(landmarks["left_hip"]), 
             get_landmark(landmarks["left_knee"]), 
@@ -174,8 +182,8 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             get_landmark(landmarks["right_ankle"])
         )
         
-        # Hip angles (extension/flexion)
-        # Use torso as reference (approximate with a vertical line from hip)
+        # Hip angles in the frontal image plane
+        # Use image vertical as reference from the hip
         left_hip_vertical = get_landmark(landmarks["left_hip"]) + np.array([0, -1, 0])
         right_hip_vertical = get_landmark(landmarks["right_hip"]) + np.array([0, -1, 0])
         
@@ -190,8 +198,8 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             get_landmark(landmarks["right_knee"])
         )
         
-        # Ankle angles (dorsiflexion/plantarflexion)
-        # Approximate with a horizontal line from ankle
+        # Ankle angles in the frontal image plane
+        # Use image horizontal as reference from the ankle
         left_ankle_horizontal = get_landmark(landmarks["left_ankle"]) + np.array([1, 0, 0])
         right_ankle_horizontal = get_landmark(landmarks["right_ankle"]) + np.array([1, 0, 0])
         
@@ -206,7 +214,7 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             right_ankle_horizontal
         )
         
-        # Shoulder angles (flexion/extension)
+        # Shoulder angles in the frontal image plane
         # left_shoulder_vertical = get_landmark(landmarks["left_shoulder"]) + np.array([0, -1, 0])
         # right_shoulder_vertical = get_landmark(landmarks["right_shoulder"]) + np.array([0, -1, 0])
         
@@ -221,7 +229,7 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             get_landmark(landmarks["right_elbow"])
         )
         
-        # Elbow angles (extension/flexion)
+        # Elbow angles in the frontal image plane
         left_elbow_angle = calculate_angle(
             get_landmark(landmarks["left_shoulder"]),
             get_landmark(landmarks["left_elbow"]),
@@ -233,7 +241,7 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             get_landmark(landmarks["right_wrist"])
         )
         
-        # Trunk flexion (forward/backward lean)
+        # Trunk angle relative to image vertical in the frontal plane
         left_hip = get_landmark(landmarks["left_hip"])
         right_hip = get_landmark(landmarks["right_hip"])
         hip_center = (left_hip + right_hip) / 2
@@ -251,12 +259,18 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             shoulder_center
         )
         
-        # Trunk lateral flexion (side bend)
+        # Trunk lateral angle in the frontal image plane
         # Create a line from left hip to right hip
-        hip_line = right_hip - left_hip
+        left_hip_frontal = project_to_frontal(left_hip)
+        right_hip_frontal = project_to_frontal(right_hip)
+        hip_line = right_hip_frontal - left_hip_frontal
         # Create a perpendicular line (up) from the hip line
         hip_up = np.cross(hip_line, np.array([0, 0, 1]))
-        hip_up = hip_up / np.linalg.norm(hip_up)
+        hip_up_norm = np.linalg.norm(hip_up)
+        if hip_up_norm == 0 or np.isnan(hip_up_norm):
+            hip_up = np.array([0, -1, 0])
+        else:
+            hip_up = hip_up / hip_up_norm
         
         # Line from hip center to shoulder center
         hip_to_shoulder = shoulder_center - hip_center
@@ -266,15 +280,13 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
         hip_to_shoulder_frontal = hip_to_shoulder - np.dot(hip_to_shoulder, frontal_plane_normal) * frontal_plane_normal
         
         # Calculate the angle between hip_up and hip_to_shoulder_frontal
-        trunk_lateral_flexion = np.degrees(np.arccos(
-            np.clip(np.dot(hip_up, hip_to_shoulder_frontal) / np.linalg.norm(hip_to_shoulder_frontal), -1.0, 1.0)
-        ))
+        trunk_lateral_flexion = safe_vector_angle(hip_up, hip_to_shoulder_frontal)
         
         # Neck angles
         neck = get_landmark(landmarks["neck"])
         nose = get_landmark(landmarks["nose"])
         
-        # Neck flexion
+        # Neck angle relative to image vertical in the frontal plane
         neck_vertical = neck + np.array([0, -1, 0])
         neck_flexion = calculate_angle(
             neck_vertical,
@@ -282,7 +294,7 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
             nose
         )
         
-        # Neck lateral flexion
+        # Neck lateral angle in the frontal image plane
         left_ear = get_landmark(landmarks["left_ear"])
         right_ear = get_landmark(landmarks["right_ear"])
         ear_center = (left_ear + right_ear) / 2
@@ -294,9 +306,7 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
         neck_to_ear_frontal = neck_to_ear - np.dot(neck_to_ear, frontal_plane_normal) * frontal_plane_normal
         
         # Calculate the angle between vertical and neck_to_ear_frontal
-        neck_lateral_flexion = np.degrees(np.arccos(
-            np.clip(np.dot(np.array([0, -1, 0]), neck_to_ear_frontal) / np.linalg.norm(neck_to_ear_frontal), -1.0, 1.0)
-        ))
+        neck_lateral_flexion = safe_vector_angle(np.array([0, -1, 0]), neck_to_ear_frontal)
         
         # Calculate symmetry metrics (absolute difference between left and right)
         knee_angle_symmetry = abs(left_knee_angle - right_knee_angle)

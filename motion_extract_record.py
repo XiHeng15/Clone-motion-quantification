@@ -10,22 +10,34 @@ mp_drawing = mp.solutions.drawing_utils
 mp_drawing_styles = mp.solutions.drawing_styles
 mp_pose = mp.solutions.pose
 
+def project_to_frontal(point: np.ndarray) -> np.ndarray:
+    """
+    Project a MediaPipe 3D landmark onto the camera's frontal image plane.
+    """
+    point = np.array(point)
+    return np.array([point[0], point[1], 0.0])
+
+
 # Function to calculate angle between three points
 def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """
-    Calculate the angle between three points in 3D space.
+    Calculate the frontal-plane angle between three MediaPipe points.
     The angle is calculated at point b.
     """
-    a = np.array(a)
-    b = np.array(b)
-    c = np.array(c)
+    a = project_to_frontal(a)
+    b = project_to_frontal(b)
+    c = project_to_frontal(c)
     
     # Calculate vectors
     ba = a - b
     bc = c - b
     
+    denominator = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if denominator == 0 or np.isnan(denominator):
+        return np.nan
+
     # Calculate cosine of angle using dot product
-    cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+    cosine_angle = np.dot(ba, bc) / denominator
     angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
     
     # Convert to degrees

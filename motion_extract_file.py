@@ -103,14 +103,22 @@ def apply_rolling_median(
     
     return filtered_landmarks
 
+def project_to_frontal(point: np.ndarray) -> np.ndarray:
+    """
+    Project a MediaPipe 3D landmark onto the camera's frontal image plane.
+    """
+    point = np.array(point)
+    return np.array([point[0], point[1], 0.0])
+
+
 def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
     """
-    Calculate the angle between three points in 3D space.
+    Calculate the frontal-plane angle between three MediaPipe points.
     The angle is calculated at point b.
     """
-    a = np.array(a)
-    b = np.array(b)
-    c = np.array(c)
+    a = project_to_frontal(a)
+    b = project_to_frontal(b)
+    c = project_to_frontal(c)
 
     ba = a - b
     bc = c - b
