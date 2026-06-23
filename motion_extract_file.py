@@ -13,6 +13,7 @@ from mediapipe.tasks.python import vision
 
 LANDMARK_COUNT = 33
 POSE_CONNECTIONS = mp.solutions.pose.POSE_CONNECTIONS
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".wmv"}
 
 def normalize_landmarks(landmarks: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
     left_hip = np.array(landmarks[23])
@@ -44,7 +45,7 @@ def nan_landmarks() -> List[Tuple[float, float, float]]:
 
 def ensure_output_person_frame(
     landmarks_history: List[
-        Tuple[int, int, Optional[float], bool, bool, List[Tuple[float, float, float]]]
+        Tuple[int, int, Optional[int], Optional[float], bool, bool, List[Tuple[float, float, float]]]
     ],
     frame_idx: int,
     output_person_id: Optional[int],
@@ -63,7 +64,7 @@ def ensure_output_person_frame(
         landmarks = normalize_landmarks(landmarks)
 
     landmarks_history.append(
-        (frame_idx, output_person_id, None, False, False, landmarks)
+        (frame_idx, output_person_id, None, None, False, False, landmarks)
     )
 
 def apply_rolling_median(
@@ -344,6 +345,59 @@ def has_box_overlap(box: np.ndarray, boxes: np.ndarray, threshold: float) -> boo
     )
 
 
+def identity_recovery_score(
+    previous_box: Optional[np.ndarray],
+    current_box: np.ndarray,
+) -> float:
+    if previous_box is None:
+        return float("inf")
+
+    prev_center = np.array(
+        [
+            (previous_box[0] + previous_box[2]) / 2,
+            (previous_box[1] + previous_box[3]) / 2,
+        ]
+    )
+    curr_center = np.array(
+        [
+            (current_box[0] + current_box[2]) / 2,
+            (current_box[1] + current_box[3]) / 2,
+        ]
+    )
+    prev_width = max(previous_box[2] - previous_box[0], 1.0)
+    prev_height = max(previous_box[3] - previous_box[1], 1.0)
+    curr_width = max(current_box[2] - current_box[0], 1.0)
+    curr_height = max(current_box[3] - current_box[1], 1.0)
+    prev_diag = max(np.linalg.norm([prev_width, prev_height]), 1.0)
+
+    center_score = np.linalg.norm(curr_center - prev_center) / prev_diag
+    area_score = abs((curr_width * curr_height) - (prev_width * prev_height)) / max(
+        prev_width * prev_height,
+        1.0,
+    )
+    aspect_score = abs((curr_width / curr_height) - (prev_width / prev_height))
+    return float(center_score + 0.5 * area_score + 0.25 * aspect_score)
+
+
+def select_recovered_track_id(
+    detections: List[dict],
+    previous_box: Optional[np.ndarray],
+    recovery_threshold: float,
+) -> Optional[int]:
+    best_track_id = None
+    best_score = float("inf")
+
+    for detection in detections:
+        score = identity_recovery_score(previous_box, detection["box"])
+        if score < best_score:
+            best_score = score
+            best_track_id = detection["track_id"]
+
+    if best_track_id is not None and best_score <= recovery_threshold:
+        return best_track_id
+    return None
+
+
 def crop_person(
     image: np.ndarray,
     box: np.ndarray,
@@ -479,7 +533,7 @@ def detect_people_with_yolo(
 
 def save_to_csv(
     landmarks_history: List[
-        Tuple[int, int, Optional[float], bool, bool, List[Tuple[float, float, float]]]
+        Tuple[int, int, Optional[int], Optional[float], bool, bool, List[Tuple[float, float, float]]]
     ],
     filename: str = "pose_data.csv",
     output_person_id: Optional[int] = 1,
@@ -499,6 +553,7 @@ def save_to_csv(
         header = [
             "frame",
             "person_id",
+            "source_track_id",
             "yolo_confidence",
             "overlap_warning",
             "is_anatomically_valid",
@@ -507,10 +562,11 @@ def save_to_csv(
             header.extend([f"landmark_{i}_x", f"landmark_{i}_y", f"landmark_{i}_z"])
         writer.writerow(header)
 
-        for frame_idx, person_id, yolo_confidence, overlap_warning, is_valid, landmarks in landmarks_history:
+        for frame_idx, person_id, source_track_id, yolo_confidence, overlap_warning, is_valid, landmarks in landmarks_history:
             row = [
                 frame_idx,
                 person_id,
+                "" if source_track_id is None else source_track_id,
                 "" if yolo_confidence is None else yolo_confidence,
                 int(overlap_warning),
                 int(is_valid),
@@ -530,6 +586,33 @@ def default_annotated_video_filename(output_file: str) -> str:
     return f"{base}_annotated.mp4"
 
 
+def is_video_file(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+
+def find_video_files(input_folder: str, recursive: bool = False) -> List[str]:
+    video_files = []
+    if recursive:
+        for root, _, filenames in os.walk(input_folder):
+            for filename in filenames:
+                path = os.path.join(root, filename)
+                if is_video_file(path):
+                    video_files.append(path)
+    else:
+        for filename in os.listdir(input_folder):
+            path = os.path.join(input_folder, filename)
+            if os.path.isfile(path) and is_video_file(path):
+                video_files.append(path)
+
+    return sorted(video_files)
+
+
+def output_csv_for_video(input_file: str, input_folder: str, output_folder: str) -> str:
+    relative_path = os.path.relpath(input_file, input_folder)
+    relative_base, _ = os.path.splitext(relative_path)
+    return os.path.join(output_folder, f"{relative_base}.csv")
+
+
 def process_video(
     input_file: str,
     output_file: str,
@@ -547,6 +630,7 @@ def process_video(
     clamp_pose_to_yolo_box: bool,
     priority_person_id: int,
     anatomy_correction_mode: str,
+    id_recovery_threshold: float,
     output_person_id: Optional[int],
 ):
     """
@@ -589,12 +673,14 @@ def process_video(
     yolo_model = create_yolo_model(yolo_model_name) if use_yolo_gate else None
     running_mode = vision.RunningMode.IMAGE if use_yolo_gate else vision.RunningMode.VIDEO
     pose_max_count = 1 if use_yolo_gate else max_poses
+    active_source_track_id = output_person_id
 
     if use_yolo_gate:
         print(f"YOLO person gate enabled with model: {yolo_model_name}")
         print(f"Skipping overlapped people above IoU {overlap_iou} unless --keep-overlaps is set")
         if output_person_id is not None:
             print(f"Only person ID {output_person_id} will be written to the CSV")
+            print(f"ID recovery threshold: {id_recovery_threshold}")
 
     with create_pose_landmarker(model_path, pose_max_count, running_mode) as pose:
         landmarks_history = []
@@ -619,18 +705,45 @@ def process_video(
                 detections = detections[:max_poses]
                 boxes = np.array([detection["box"] for detection in detections])
                 colors = get_person_colors(len(detections))
+                recovered_track_id = None
+
+                if output_person_id is not None:
+                    track_ids = {detection["track_id"] for detection in detections}
+                    if active_source_track_id not in track_ids:
+                        recovered_track_id = select_recovered_track_id(
+                            detections,
+                            prev_box_by_person.get(output_person_id),
+                            id_recovery_threshold,
+                        )
+                        if recovered_track_id is not None:
+                            print(
+                                f"Frame {frame_count}: recovered output person "
+                                f"{output_person_id} from YOLO track "
+                                f"{active_source_track_id} to {recovered_track_id}"
+                            )
+                            active_source_track_id = recovered_track_id
 
                 for detection_idx, detection in enumerate(detections):
                     box = detection["box"]
-                    person_id = detection["track_id"]
+                    source_track_id = detection["track_id"]
+                    person_id = source_track_id
+                    is_selected_output_person = True
+                    if output_person_id is not None:
+                        is_selected_output_person = source_track_id == active_source_track_id
+                        if is_selected_output_person:
+                            person_id = output_person_id
+
                     overlap_warning = has_box_overlap(box, boxes, overlap_iou)
                     color = (0, 0, 255) if overlap_warning else colors[detection_idx]
 
                     x1, y1, x2, y2 = box.astype(int)
                     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+                    label = f"ID {source_track_id} {detection['confidence']:.2f}"
+                    if source_track_id != person_id:
+                        label = f"ID {source_track_id}->P{person_id} {detection['confidence']:.2f}"
                     cv2.putText(
                         image,
-                        f"ID {person_id} {detection['confidence']:.2f}",
+                        label,
                         (x1, max(20, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.55,
@@ -638,7 +751,7 @@ def process_video(
                         2,
                     )
 
-                    if output_person_id is not None and person_id != output_person_id:
+                    if not is_selected_output_person:
                         continue
 
                     should_skip_overlap = (
@@ -729,6 +842,7 @@ def process_video(
                         if anatomy_correction_mode == "fallback":
                             if prev_pose is not None:
                                 frame_landmarks = prev_pose
+                                box = prev_box if prev_box is not None else box
                                 is_valid = True
                         # if mode is flag, keep the invalid frame and mark it
 
@@ -741,6 +855,7 @@ def process_video(
                         (
                             frame_count,
                             person_id,
+                            source_track_id,
                             detection["confidence"],
                             overlap_warning,
                             is_valid,
@@ -772,7 +887,7 @@ def process_video(
                     )
                     smoothed_landmarks_by_person[person_id] = frame_landmarks
                     landmarks_history.append(
-                        (frame_count, person_id, None, False, True, frame_landmarks)
+                        (frame_count, person_id, person_id, None, False, True, frame_landmarks)
                     )
                     written_person_ids.add(person_id)
 
@@ -865,10 +980,20 @@ def draw_knee_angles(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract multi-person pose data from a video file using MediaPipe."
+        description="Extract multi-person pose data from one video file or every video in a folder using MediaPipe."
     )
-    parser.add_argument("-i", "--input", required=True, help="Input video file path")
-    parser.add_argument("-o", "--output", required=True, help="Output CSV file path")
+    parser.add_argument(
+        "-i",
+        "--input",
+        required=True,
+        help="Input video file path, or a folder containing videos",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Output CSV file path for one video, or output folder when input is a folder",
+    )
     parser.add_argument(
         "-m",
         "--model",
@@ -938,6 +1063,12 @@ def main():
         help="How to handle frames that fail anatomical validation: fallback=use previous valid pose, flag=keep and mark invalid.",
     )
     parser.add_argument(
+        "--id-recovery-threshold",
+        type=float,
+        default=1.35,
+        help="Maximum box-similarity score for recovering the output person after YOLO changes track IDs; higher is more permissive.",
+    )
+    parser.add_argument(
         "--priority-person-id",
         type=int,
         default=1,
@@ -959,18 +1090,21 @@ def main():
         action="store_true",
         help="Do not save an annotated skeleton/overlay video.",
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="When input is a folder, process videos in subfolders too.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="When input is a folder, skip videos whose output CSV already exists.",
+    )
 
     args = parser.parse_args()
     args.landmark_smoothing = min(max(args.landmark_smoothing, 0.0), 0.95)
     output_person_id = None if args.output_person_id < 0 else args.output_person_id
-    annotated_video_file = None
-    if not args.no_annotated_video:
-        annotated_video_file = args.annotated_video or default_annotated_video_filename(args.output)
-
-    process_video(
-        args.input,
-        args.output,
-        annotated_video_file,
+    common_options = (
         args.model,
         args.max_poses,
         args.use_yolo_gate,
@@ -984,8 +1118,47 @@ def main():
         not args.allow_pose_outside_yolo_box,
         args.priority_person_id,
         args.anatomy_correction_mode,
+        args.id_recovery_threshold,
         output_person_id,
     )
+
+    if os.path.isdir(args.input):
+        if args.annotated_video:
+            parser.error("--annotated-video can only be used when processing one video file")
+
+        input_folder = os.path.abspath(args.input)
+        output_folder = os.path.abspath(args.output)
+        video_files = find_video_files(input_folder, args.recursive)
+
+        if not video_files:
+            print(f"No videos found in {input_folder}")
+            return
+
+        os.makedirs(output_folder, exist_ok=True)
+        print(f"Found {len(video_files)} video(s) in {input_folder}")
+
+        for index, input_file in enumerate(video_files, start=1):
+            output_file = output_csv_for_video(input_file, input_folder, output_folder)
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
+            if args.skip_existing and os.path.exists(output_file):
+                print(f"[{index}/{len(video_files)}] Skipping existing CSV: {output_file}")
+                continue
+
+            annotated_video_file = None
+            if not args.no_annotated_video:
+                annotated_video_file = default_annotated_video_filename(output_file)
+
+            print(f"[{index}/{len(video_files)}] Processing {input_file}")
+            process_video(input_file, output_file, annotated_video_file, *common_options)
+
+        print("Batch processing complete.")
+    else:
+        annotated_video_file = None
+        if not args.no_annotated_video:
+            annotated_video_file = args.annotated_video or default_annotated_video_filename(args.output)
+
+        process_video(args.input, args.output, annotated_video_file, *common_options)
 
 
 if __name__ == "__main__":

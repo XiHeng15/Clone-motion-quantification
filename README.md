@@ -36,6 +36,25 @@ Example:
 python motion_extract_file.py -i patient_assessment.mp4 -o pose_data.csv
 ```
 
+To process every video in a folder and create one matching CSV per video, pass the
+folder as the input and an output folder as the output:
+```
+python motion_extract_file.py -i videos -o extracted_pose_data
+```
+
+This creates files like:
+```
+videos/session_01.mp4 -> extracted_pose_data/session_01.csv
+videos/session_02.mov -> extracted_pose_data/session_02.csv
+```
+
+Useful batch options:
+```
+python motion_extract_file.py -i videos -o extracted_pose_data --skip-existing
+python motion_extract_file.py -i videos -o extracted_pose_data --recursive
+python motion_extract_file.py -i videos -o extracted_pose_data --no-annotated-video
+```
+
 #### From Webcam (`motion_extract_record.py`)
 
 Captures live pose data from your webcam.
