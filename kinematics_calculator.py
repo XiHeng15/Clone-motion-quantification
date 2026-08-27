@@ -2,11 +2,30 @@ import pandas as pd
 import numpy as np
 import argparse
 import os
+import tempfile
 from typing import List, Tuple, Dict, Union
 
 
 FrameKey = Union[int, Tuple[int, int]]
 TARGET_PERSON_ID = 1
+DEFAULT_GRAPH_FPS = 30.0
+DEFAULT_GRAPH_WINDOW_SECONDS = 30.0
+GRAPH_VIDEO_GROUPS = {
+    "left_upper_body": [
+        "left_shoulder_angle",
+        "left_elbow_angle",
+    ],
+    "right_upper_body": [
+        "right_shoulder_angle",
+        "right_elbow_angle",
+    ],
+    "middle": [
+        "trunk_flexion",
+        "trunk_lateral_flexion",
+        "neck_flexion",
+        "neck_lateral_flexion",
+    ],
+}
 
 def project_to_frontal(point: np.ndarray) -> np.ndarray:
     """ 
@@ -347,10 +366,11 @@ def calculate_kinematics(frames_data: Dict[FrameKey, List[Tuple[float, float, fl
 def create_angle_graph_video(kinematics_df: pd.DataFrame,
     output_video: str,
     angle_columns: List[str],
-    fps: float,):
+    fps: float,
+    title: str = "Joint Angles Over Time",
+    window_seconds: float = DEFAULT_GRAPH_WINDOW_SECONDS,):
     """
     Create a video with graphs of the calculated angles over time.
-    This function is a placeholder and can be implemented using libraries like matplotlib and OpenCV.
     """
     import matplotlib.pyplot as plt
     import cv2
@@ -361,6 +381,7 @@ def create_angle_graph_video(kinematics_df: pd.DataFrame,
     width, height = 960, 720
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    os.makedirs(os.path.dirname(output_video) or ".", exist_ok=True)
     writer = cv2.VideoWriter(output_video, fourcc, fps, (width, height))
     if not writer.isOpened():
         print(f"Error: Could not open video writer for {output_video}")
@@ -369,34 +390,109 @@ def create_angle_graph_video(kinematics_df: pd.DataFrame,
     if not valid_angle_columns:
         print("Error: No valid angle columns found in DataFrame")
         writer.release()
-        return  
-    x_values = df["time"].to_numpy()
-    for i in range(len(df)):
-        plt.figure(figsize=(width / 100, height / 100), dpi=100)
-        for col in valid_angle_columns:
-            plt.plot(x_values[:i+1], df[col][:i+1], label=col)
-        plt.xlabel("Time (s)")
-        plt.ylabel("Angle (degrees)")
-        plt.title("Joint Angles Over Time")
-        plt.legend()
-        plt.xlim(0, x_values[-1])
-        plt.ylim(0, 180)
-        plt.grid()
-        
-        plt.tight_layout()
-        
-        # Save the plot to a temporary image file
-        temp_image = "temp_plot.png"
-        plt.savefig(temp_image)
-        plt.close()
-        
-        # Read the image and write it to the video
-        frame = cv2.imread(temp_image)
-        if frame is not None:
-            writer.write(frame)
-        else:
-            print(f"Error: Could not read temporary image {temp_image}")
-        os.remove(temp_image)
+        return
+    if df.empty:
+        print(f"Error: No kinematics rows available for {output_video}")
+        writer.release()
+        return
+    try:
+        x_values = df["time"].to_numpy()
+        total_frames = len(df)
+        print(f"{title}: Starting video render to {output_video} ({total_frames} frames)")
+        last_pct = -1
+        for i in range(total_frames):
+            current_time = x_values[i]
+            x_max = max(window_seconds, current_time)
+            x_min = max(0, x_max - window_seconds)
+
+            plt.figure(figsize=(width / 100, height / 100), dpi=100)
+            for col in valid_angle_columns:
+                plt.plot(x_values[:i+1], df[col][:i+1], label=col)
+            plt.xlabel("Time (s)")
+            plt.ylabel("Angle (degrees)")
+            plt.title(title)
+            plt.legend()
+            plt.xlim(x_min, x_max)
+            plt.ylim(0, 180)
+            plt.grid()
+
+            plt.tight_layout()
+
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+                temp_image = temp_file.name
+            try:
+                plt.savefig(temp_image)
+                plt.close()
+
+                frame = cv2.imread(temp_image)
+                if frame is not None:
+                    writer.write(frame)
+                else:
+                    print(f"Error: Could not read temporary image {temp_image}")
+            finally:
+                if os.path.exists(temp_image):
+                    os.remove(temp_image)
+
+            # Print progress as percentage, update only when it changes to reduce churn
+            pct = int((i + 1) * 100 / max(1, total_frames))
+            if pct != last_pct:
+                print(f"{title}: Rendering frame {i+1}/{total_frames} ({pct}%)", end="\r", flush=True)
+                last_pct = pct
+    finally:
+        writer.release()
+        # Finish the progress line and print a newline
+        print()
+        print(f"{title} video saved to {output_video}")
+
+
+def graph_video_paths(base_video: str) -> Dict[str, str]:
+    """
+    Build the three graph-video output paths from a single user-provided base path.
+    """
+    directory = os.path.dirname(base_video)
+    stem, extension = os.path.splitext(os.path.basename(base_video))
+    extension = extension or ".mp4"
+
+    for suffix in ("_upper_body_angles", "_angles"):
+        if stem.endswith(suffix):
+            stem = stem[:-len(suffix)]
+            break
+
+    return {
+        "left_upper_body": os.path.join(directory, f"{stem}_left_upper_body_angles{extension}"),
+        "right_upper_body": os.path.join(directory, f"{stem}_right_upper_body_angles{extension}"),
+        "middle": os.path.join(directory, f"{stem}_middle_angles{extension}"),
+    }
+
+
+def create_grouped_graph_videos(
+    kinematics_df: pd.DataFrame,
+    base_video: str,
+    fps: float,
+    window_seconds: float = DEFAULT_GRAPH_WINDOW_SECONDS,
+) -> Dict[str, str]:
+    """
+    Create the left upper body, right upper body, and middle area graph videos.
+    """
+    output_paths = graph_video_paths(base_video)
+    titles = {
+        "left_upper_body": "Left Upper Body Angles Over Time",
+        "right_upper_body": "Right Upper Body Angles Over Time",
+        "middle": "Middle Area Angles Over Time",
+    }
+
+    for group_name, columns in GRAPH_VIDEO_GROUPS.items():
+        create_angle_graph_video(
+            kinematics_df,
+            output_paths[group_name],
+            columns,
+            fps,
+            titles[group_name],
+            window_seconds,
+        )
+        print(f"{titles[group_name]} video saved to {output_paths[group_name]}")
+
+    return output_paths
 
 
 def main():
@@ -405,6 +501,28 @@ def main():
     parser.add_argument("input_csv", help="Path to the input CSV file containing pose data")
     parser.add_argument("--output", "-o", help="Path to the output CSV file (default: 'clinical_kinematics.csv')", 
                         default="clinical_kinematics.csv")
+    parser.add_argument(
+        "--graph-video",
+        help=(
+            "Base MP4 path for graph videos. Creates three files: left upper body, "
+            "right upper body, and middle area angles."
+        ),
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=DEFAULT_GRAPH_FPS,
+        help=f"Frames per second for graph videos (default: {DEFAULT_GRAPH_FPS:g})",
+    )
+    parser.add_argument(
+        "--graph-window-seconds",
+        type=float,
+        default=DEFAULT_GRAPH_WINDOW_SECONDS,
+        help=(
+            "Visible time window for graph videos in seconds "
+            f"(default: {DEFAULT_GRAPH_WINDOW_SECONDS:g})"
+        ),
+    )
     args = parser.parse_args()
     
     # Parse the input CSV file
@@ -424,6 +542,14 @@ def main():
         print(f"Clinical kinematics data saved to {args.output}")
     except Exception as e:
         print(f"Error saving kinematics data: {e}")
+
+    if args.graph_video:
+        create_grouped_graph_videos(
+            kinematics_df,
+            args.graph_video,
+            args.fps,
+            args.graph_window_seconds,
+        )
 
 
 if __name__ == "__main__":
